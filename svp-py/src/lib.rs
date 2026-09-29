@@ -151,9 +151,9 @@ impl From<PyBranchOpenError> for PyErr {
                 description,
                 retry_after,
             } => BranchRateLimited::new_err((url.to_string(), description, retry_after)),
-            silver_platter::vcs::BranchOpenError::Unavailable { url, description } => {
-                BranchUnavailable::new_err((url.to_string(), description))
-            }
+            silver_platter::vcs::BranchOpenError::Unavailable {
+                url, description, ..
+            } => BranchUnavailable::new_err((url.to_string(), description)),
             silver_platter::vcs::BranchOpenError::TemporarilyUnavailable { url, description } => {
                 BranchTemporarilyUnavailable::new_err((url.to_string(), description))
             }

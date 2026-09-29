@@ -45,6 +45,9 @@ pub enum BranchOpenError {
 
         /// A description of the error.
         description: String,
+
+        /// The HTTP status code, when known.
+        http_status: Option<u16>,
     },
     /// The branch is temporarily unavailable.
     TemporarilyUnavailable {
@@ -85,7 +88,9 @@ impl std::fmt::Display for BranchOpenError {
                 "Rate limited {}: {} (retry after: {:?})",
                 url, description, retry_after
             ),
-            BranchOpenError::Unavailable { url, description } => {
+            BranchOpenError::Unavailable {
+                url, description, ..
+            } => {
                 write!(f, "Unavailable {}: {}", url, description)
             }
             BranchOpenError::TemporarilyUnavailable { url, description } => {
@@ -111,6 +116,7 @@ impl BranchOpenError {
             BrzError::DependencyNotPresent(l, e) => Self::Unavailable {
                 url,
                 description: format!("missing {}: {}", l, e),
+                http_status: None,
             },
             BrzError::NoColocatedBranchSupport => Self::Unsupported {
                 url,
@@ -120,6 +126,7 @@ impl BranchOpenError {
             BrzError::Socket(e) => Self::Unavailable {
                 url,
                 description: format!("Socket error: {}", e),
+                http_status: None,
             },
             BrzError::UnsupportedProtocol(url, extra) => Self::Unsupported {
                 url: url.parse().unwrap(),
@@ -142,6 +149,7 @@ impl BranchOpenError {
                     Self::Unavailable {
                         url,
                         description: msg.to_string(),
+                        http_status: None,
                     }
                 }
             }
@@ -152,6 +160,7 @@ impl BranchOpenError {
                     path.to_string_lossy(),
                     extra.as_deref().unwrap_or("")
                 ),
+                http_status: None,
             },
             BrzError::InvalidURL(url, extra) => Self::Unavailable {
                 url: url.parse().unwrap(),
@@ -159,6 +168,7 @@ impl BranchOpenError {
                     .as_ref()
                     .map(|s| s.to_string())
                     .unwrap_or_else(|| format!("Invalid URL: {}", url)),
+                http_status: None,
             },
             BrzError::InvalidHttpResponse(_path, msg, _orig_error, headers) => {
                 if msg.to_string().contains("Unexpected HTTP status 429") {
@@ -190,16 +200,24 @@ impl BranchOpenError {
                     Self::Unavailable {
                         url,
                         description: e.to_string(),
+                        http_status: None,
                     }
                 }
             }
+            BrzError::UnexpectedHttpStatus { code, .. } => Self::Unavailable {
+                url,
+                description: e.to_string(),
+                http_status: Some(*code),
+            },
             BrzError::TransportError(message) => Self::Unavailable {
                 url,
                 description: message.to_string(),
+                http_status: None,
             },
             BrzError::UnusableRedirect(source, target, reason) => Self::Unavailable {
                 url,
                 description: format!("Unusable redirect: {} -> {}: {}", source, target, reason),
+                http_status: None,
             },
             BrzError::UnsupportedVcs(vcs) => Self::Unsupported {
                 url,
@@ -219,14 +237,17 @@ impl BranchOpenError {
             BrzError::RemoteGitError(msg) => Self::Unavailable {
                 url,
                 description: msg.to_string(),
+                http_status: None,
             },
             BrzError::LineEndingError(msg) => Self::Unavailable {
                 url,
                 description: msg.to_string(),
+                http_status: None,
             },
             BrzError::IncompleteRead(_partial, _expected) => Self::Unavailable {
                 url,
                 description: e.to_string(),
+                http_status: None,
             },
             _ => Self::Other(e.to_string()),
         }
@@ -388,6 +409,7 @@ mod tests {
         let err = BranchOpenError::Unavailable {
             url: Url::parse("https://example.com/repo").unwrap(),
             description: "Server unavailable".to_string(),
+            http_status: None,
         };
         assert_eq!(
             err.to_string(),
@@ -455,6 +477,29 @@ mod tests {
                 assert_eq!(description, "Temporary failure in name resolution");
             }
             _ => panic!("Expected TemporarilyUnavailable error"),
+        }
+    }
+
+    #[test]
+    fn test_branch_open_error_from_unexpected_http_status() {
+        let url = Url::parse("https://example.com/repo").unwrap();
+        let brz_err = BrzError::UnexpectedHttpStatus {
+            url: url.clone(),
+            code: 429,
+            extra: Some("Too Many Requests".to_string()),
+            headers: Default::default(),
+        };
+        let err = BranchOpenError::from_err(url.clone(), &brz_err);
+        match err {
+            BranchOpenError::Unavailable {
+                url: err_url,
+                http_status,
+                ..
+            } => {
+                assert_eq!(err_url, url);
+                assert_eq!(http_status, Some(429));
+            }
+            _ => panic!("Expected Unavailable error"),
         }
     }
 }
