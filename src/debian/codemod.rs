@@ -185,6 +185,36 @@ pub struct DetailedFailure {
     pub details: Option<serde_json::Value>,
 }
 
+/// Source name from the first changelog entry. Errors after the first
+/// entry's footer are tolerated.
+fn changelog_source_name(text: Vec<u8>) -> Result<Option<String>, Error> {
+    let text = String::from_utf8(text)?;
+    let parsed = ChangeLog::parse(&text);
+    let footer_line = parsed
+        .tree()
+        .iter()
+        .next()
+        .and_then(|e| e.footer())
+        .map(|f| f.line());
+    let errors = parsed
+        .errors_with_offsets()
+        .iter()
+        .take_while(|(_, offset)| {
+            let line = text[..usize::from(*offset)].matches('\n').count();
+            footer_line.is_none_or(|footer| line <= footer)
+        })
+        .cloned()
+        .collect();
+    Ok(
+        debian_changelog::Parse::<ChangeLog>::new(parsed.green().clone(), errors)
+            .to_result()
+            .map_err(Error::ChangelogParse)?
+            .iter()
+            .next()
+            .and_then(|e| e.package()),
+    )
+}
+
 /// Run a script in a tree and commit the result.
 ///
 /// This ignores newly added files.
@@ -234,11 +264,7 @@ pub fn script_runner(
 
     let cl_path = debian_path.join("changelog");
     let source_name = match local_tree.get_file_text(&cl_path) {
-        Ok(text) => debian_changelog::ChangeLog::read(text.as_slice())
-            .unwrap()
-            .iter()
-            .next()
-            .and_then(|e| e.package()),
+        Ok(text) => changelog_source_name(text)?,
         Err(BrzError::NoSuchFile(_)) => None,
         Err(e) => {
             return Err(Error::Other(format!("Failed to read changelog: {}", e)));
@@ -303,11 +329,7 @@ pub fn script_runner(
         source_name
     } else {
         match local_tree.get_file_text(&cl_path) {
-            Ok(text) => match ChangeLog::read(text.as_slice())?
-                .iter()
-                .next()
-                .and_then(|e| e.package())
-            {
+            Ok(text) => match changelog_source_name(text)? {
                 Some(source_name) => source_name,
                 None => {
                     return Err(Error::Other(format!(
@@ -423,4 +445,101 @@ pub fn script_runner(
         serialized_context: result.serialized_context,
         target_branch_url: result.target_branch_url,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use breezyshim::controldir::create_standalone_workingtree;
+    use breezyshim::testing::TestEnv;
+    use breezyshim::tree::MutableTree;
+    use breezyshim::WorkingTree;
+    use serial_test::serial;
+
+    #[test]
+    #[serial]
+    fn test_source_name_from_changelog() {
+        let _test_env = TestEnv::new();
+        let td = tempfile::tempdir().unwrap();
+        let d = td.path().join("t");
+        let tree = create_standalone_workingtree(&d, "bzr").unwrap();
+        std::fs::create_dir(d.join("debian")).unwrap();
+        // The old entry has text after the urgency, which the strict parser rejects.
+        std::fs::write(
+            d.join("debian/changelog"),
+            r#"foo (1.1-1) unstable; urgency=medium
+
+  * New upstream release.
+
+ -- Joe Example <joe@example.com>  Tue, 02 Jan 2024 00:00:00 +0000
+
+foo (1.0-1) unstable; urgency=low (HIGH for new source format)
+
+  * Initial release.
+
+ -- Joe Example <joe@example.com>  Mon, 01 Jan 2024 00:00:00 +0000
+"#,
+        )
+        .unwrap();
+        tree.add(&[
+            std::path::Path::new("debian"),
+            std::path::Path::new("debian/changelog"),
+        ])
+        .unwrap();
+        tree.build_commit().message("initial").commit().unwrap();
+        let result = super::script_runner(
+            &tree,
+            &["sh", "-c", "echo foo > bar; echo Did a thing"],
+            std::path::Path::new(""),
+            crate::CommitPending::Auto,
+            None,
+            Some("Joe Example <joe@example.com>"),
+            None,
+            std::process::Stdio::null(),
+            Some(false),
+        )
+        .unwrap();
+
+        assert_eq!(result.source_name, "foo");
+        assert_eq!(result.description, "Did a thing\n");
+    }
+
+    #[test]
+    fn test_source_name_from_bad_first_entry() {
+        let older = "bar (1.0-1) unstable; urgency=medium
+
+  * Initial release.
+
+ -- Joe Example <joe@example.com>  Mon, 01 Jan 2024 00:00:00 +0000
+";
+        for first in [
+            "foo (1.1-1) unstable; urgency=low (HIGH for new source format)
+
+  * New upstream release.
+
+ -- Joe Example <joe@example.com>  Tue, 02 Jan 2024 00:00:00 +0000
+",
+            " foo (1.1-1) unstable; urgency=medium
+
+  * New upstream release.
+
+ -- Joe Example <joe@example.com>  Tue, 02 Jan 2024 00:00:00 +0000
+",
+            "foo (1.1-1) unstable; urgency=medium
+
+  * New upstream release.
+
+-- Joe Example <joe@example.com>  Tue, 02 Jan 2024 00:00:00 +0000
+",
+        ] {
+            let text = format!("{}\n{}", first, older);
+            let result = super::changelog_source_name(text.into_bytes());
+
+            assert!(
+                matches!(result, Err(super::Error::ChangelogParse(_))),
+                "{:?}: {:?}",
+                first,
+                result
+            );
+        }
+    }
 }
